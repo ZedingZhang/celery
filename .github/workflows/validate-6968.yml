@@ -1,0 +1,85 @@
+name: Validate nesting regression
+
+on:
+  push:
+    branches: [validate/replaced-task-nesting-6968]
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.13']
+        transport: [redis, rabbitmq, rabbitmq_redis]
+    services:
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      rabbitmq:
+        image: rabbitmq:4
+        ports: ['5672:5672']
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install focused integration dependencies
+        run: >-
+          python -m pip install -e '.[redis]'
+          pytest==9.1.1 pytest-celery==1.3.0
+          pytest-rerunfailures==16.7 pytest-timeout==2.4.0 pydantic
+      - name: Select broker and backend
+        env:
+          TRANSPORT: ${{ matrix.transport }}
+        run: |
+          case "$TRANSPORT" in
+            redis) echo 'TEST_BROKER=redis://' >> "$GITHUB_ENV"; echo 'TEST_BACKEND=redis://' >> "$GITHUB_ENV" ;;
+            rabbitmq) echo 'TEST_BROKER=pyamqp://' >> "$GITHUB_ENV"; echo 'TEST_BACKEND=rpc' >> "$GITHUB_ENV" ;;
+            rabbitmq_redis) echo 'TEST_BROKER=pyamqp://' >> "$GITHUB_ENV"; echo 'TEST_BACKEND=redis://' >> "$GITHUB_ENV" ;;
+          esac
+      - name: Run replacement integration tests with prefork workers
+        run: python -m pytest -p celery.contrib.pytest -vv t/integration/test_tasks.py::test_task_replacement --junitxml=nesting.xml
+      - name: Verify the regression test rejects a dropped nesting header
+        run: |
+          python - <<'PY'
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          path = Path('celery/app/amqp.py')
+          original = path.read_text()
+          header = "'replaced_task_nesting': replaced_task_nesting,"
+          assert original.count(header) == 1
+          try:
+              path.write_text(original.replace(header, "'replaced_task_nesting': 0,"))
+              run = subprocess.run([
+                  sys.executable, '-m', 'pytest', '-p', 'celery.contrib.pytest', '-vv',
+                  't/integration/test_tasks.py::test_task_replacement::test_replaced_task_nesting_increments',
+                  '--junitxml=nesting-mutant.xml',
+              ])
+              assert run.returncode == 1, run.returncode
+              suite = ET.parse('nesting-mutant.xml').getroot().find('testsuite')
+              assert suite is not None
+              assert int(suite.attrib['tests']) == 3, suite.attrib
+              assert int(suite.attrib['failures']) == 2, suite.attrib
+              assert int(suite.attrib['errors']) == 0, suite.attrib
+              for case in suite.findall('testcase'):
+                  failure = case.find('failure')
+                  if failure is not None:
+                      assert 'assert [0, 0' in failure.attrib['message'], failure.attrib
+              print('PASS: zero replacements passes; both nested cases reject zeroed headers')
+          finally:
+              path.write_text(original)
+          PY
